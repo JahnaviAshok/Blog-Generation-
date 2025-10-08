@@ -1,125 +1,70 @@
-# lambda_function.py
-import os
-import json
-from datetime import datetime
-from base64 import b64decode
-
 import boto3
 import botocore.config
+import json
 
-# ---- Config ----
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-# Adjust this to the exact model ID you have access to in Bedrock:
-# e.g., "meta.llama3-8b-instruct-v1:0"
-BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.meta.llama3-1-8b-instruct-v1:0")
+from datetime import datetime
 
-S3_BUCKET = os.environ.get("BLOG_S3_BUCKET", "bedrock-demo-blogs")
+def blog_generate_using_bedrock(blogtopic:str)-> str:
+    prompt=f"""<s>[INST]Human: Write a 200 words blog on the topic {blogtopic}
+    Assistant:[/INST]
+    """
 
-_bedrock = boto3.client(
-    "bedrock-runtime",
-    region_name=AWS_REGION,
-    config=botocore.config.Config(read_timeout=200, retries={"max_attempts": 3})
-)
-
-
-def _ok(body: dict, status: int = 200, headers: dict | None = None):
-    return {
-        "statusCode": status,
-        "headers": {"Content-Type": "application/json", **(headers or {})},
-        "body": json.dumps(body),
+    body={
+        "prompt":prompt,
+        "max_gen_len":512,
+        "temperature":0.5,
+        "top_p":0.9
     }
 
-
-def _error(message: str, status: int = 500):
-    return _ok({"error": message}, status=status)
-
-
-def generate_blog(topic: str) -> str:
-    """
-    Calls Amazon Bedrock (Meta Llama 3 Instruct) to generate ~250 words.
-    """
-    prompt = f"<s>[INST]Human: Write a ~250-word blog on the topic: {topic}. Assistant:[/INST]"
-
-    body = {
-        "prompt": prompt,
-        "max_gen_len": 512,
-        "temperature": 0.5,
-        "top_p": 0.9,
-    }
-
-    resp = _bedrock.invoke_model(
-        body=json.dumps(body),
-        modelId=BEDROCK_MODEL_ID,
-        accept="application/json",
-        contentType="application/json",
-    )
-
-    # Bedrock returns a StreamingBody under 'body'
-    raw = resp["body"].read()
-    data = json.loads(raw)
-
-    # For Meta Llama on Bedrock, the text is typically under 'generation'
-    text = data.get("generation") or ""
-    return text.strip()
-
-
-def save_blog_to_s3(key: str, content: str):
-    s3 = boto3.client("s3")
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=content.encode("utf-8"),
-        ContentType="text/plain; charset=utf-8",
-    )
-
-
-def _parse_event_body(event: dict) -> dict:
-    """
-    Handles API Gateway proxy (string body) and base64 body cases.
-    """
-    if "body" not in event or event["body"] is None:
-        return {}
-
-    body_str = event["body"]
-    if event.get("isBase64Encoded"):
-        body_str = b64decode(body_str).decode("utf-8", errors="replace")
     try:
-        return json.loads(body_str)
-    except json.JSONDecodeError:
-        return {}
+        bedrock=boto3.client("bedrock-runtime",region_name="us-east-1",
+                             config=botocore.config.Config(read_timeout=300,retries={'max_attempts':3}))
+        response=bedrock.invoke_model(body=json.dumps(body),modelId="meta.llama2-13b-chat-v1")
+
+        response_content=response.get('body').read()
+        response_data=json.loads(response_content)
+        print(response_data)
+        blog_details=response_data['generation']
+        return blog_details
+    except Exception as e:
+        print(f"Error generating the blog:{e}")
+        return ""
+
+def save_blog_details_s3(s3_key,s3_bucket,generate_blog):
+    s3=boto3.client('s3')
+
+    try:
+        s3.put_object(Bucket = s3_bucket, Key = s3_key, Body =generate_blog )
+        print("Code saved to s3")
+
+    except Exception as e:
+        print("Error when saving the code to s3")
+
 
 
 def lambda_handler(event, context):
-    # Expecting JSON like: {"blogstopic": "Your topic here"}
-    body = _parse_event_body(event)
-    topic = (body.get("blogstopic") or body.get("topic") or "").strip()
+    # TODO implement
+    event=json.loads(event['body'])
+    blogtopic=event['blog_topic']
 
-    if not topic:
-        return _error("Missing required field 'blogstopic' in request body.", 400)
+    generate_blog=blog_generate_using_bedrock(blogtopic=blogtopic)
 
-    try:
-        blog_text = generate_blog(topic)
-    except Exception as e:
-        # Surface the error message for easier debugging
-        return _error(f"Error generating blog: {e}", 502)
+    if generate_blog:
+        current_time=datetime.now().strftime('%H%M%S')
+        s3_key=f"blog-output/{current_time}.txt"
+        s3_bucket='aws_bedrock_course1'
+        save_blog_details_s3(s3_key,s3_bucket,generate_blog)
 
-    if not blog_text:
-        return _error("Model returned empty content.", 502)
 
-    # Create a safe S3 key
-    ts = datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
-    safe_topic = "".join(c for c in topic if c.isalnum() or c in ("-", "_")).strip() or "blog"
-    s3_key = f"blogs/{safe_topic}_{ts}.txt"
+    else:
+        print("No blog was generated")
 
-    try:
-        save_blog_to_s3(s3_key, blog_text)
-    except Exception as e:
-        return _error(f"Failed to save to S3: {e}", 502)
+    return{
+        'statusCode':200,
+        'body':json.dumps('Blog Generation is completed')
+    }
 
-    return _ok({
-        "message": "Blog generated and saved.",
-        "s3_bucket": S3_BUCKET,
-        "s3_key": s3_key,
-        "length_chars": len(blog_text),
-        "preview": blog_text[:200] + ("..." if len(blog_text) > 200 else "")
-    })
+    
+
+
+
